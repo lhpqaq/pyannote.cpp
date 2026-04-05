@@ -1,226 +1,189 @@
-import torch
-import sys
-import numpy as np
-import gguf
-import os
-from pathlib import Path
-from scipy.linalg import eigh
+#!/usr/bin/env python3
+"""
+Convert WeSpeaker embedding checkpoint to GGUF.
 
-def fold_batch_norm(conv_w, conv_b, bn_w, bn_b, bn_mean, bn_var):
-    # conv_w: (out_channels, in_channels, kH, kW)
-    # bn params: (out_channels)
-    
-    eps = 1e-5
-    scale = bn_w / torch.sqrt(bn_var + eps)
-    shift = bn_b - bn_mean * scale
-    
-    # Reshape scale and shift for broadcasting
-    # For Conv2d weights: (out, in, k, k) -> scale needs to be (out, 1, 1, 1)
-    scale_w = scale.view(-1, 1, 1, 1)
-    
-    new_conv_w = conv_w * scale_w
-    
-    if conv_b is None:
-        new_conv_b = shift
+The output naming and metadata are aligned with the current C++ loader in
+`src/pyannote/embedding.cpp`.
+
+Usage:
+    python examples/python/convert_embedding_to_ggml.py \
+        /path/to/embedding/pytorch_model.bin \
+        /path/to/pyannote-embedding.gguf
+"""
+
+import argparse
+import struct
+import sys
+from pathlib import Path
+
+import numpy as np
+
+GGUF_MAGIC = 0x46554747
+GGUF_VERSION = 3
+GGUF_DEFAULT_ALIGNMENT = 32
+
+GGML_TYPE_F32 = 0
+GGML_TYPE_F16 = 1
+
+GGUF_TYPE_UINT32 = 4
+GGUF_TYPE_STRING = 8
+
+
+def write_gguf_string(f, value: str):
+    encoded = value.encode("utf-8")
+    f.write(struct.pack("<Q", len(encoded)))
+    f.write(encoded)
+
+
+def write_metadata_kv(f, key: str, value_type: int, value):
+    write_gguf_string(f, key)
+    f.write(struct.pack("<I", value_type))
+
+    if value_type == GGUF_TYPE_UINT32:
+        f.write(struct.pack("<I", value))
+    elif value_type == GGUF_TYPE_STRING:
+        write_gguf_string(f, value)
     else:
-        new_conv_b = conv_b * scale + shift
-        
-    return new_conv_w, new_conv_b
+        raise ValueError(f"unsupported metadata type: {value_type}")
+
+
+def align_offset(offset: int, alignment: int = GGUF_DEFAULT_ALIGNMENT) -> int:
+    return offset + (alignment - (offset % alignment)) % alignment
+
+
+def load_state_dict(model_path: str):
+    import torch
+
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        return checkpoint["state_dict"]
+    if hasattr(checkpoint, "state_dict"):
+        return checkpoint.state_dict()
+    return checkpoint
+
+
+def should_use_f16(name: str, data: np.ndarray) -> bool:
+    if "bias" in name:
+        return False
+    if "running_mean" in name or "running_var" in name:
+        return False
+    if "bn" in name or "shortcut.1" in name or "shortcut.3" in name:
+        if len(data.shape) == 1:
+            return False
+    if len(data.shape) < 2:
+        return False
+    return True
+
+
+def write_gguf(output_path: str, tensors: dict):
+    metadata = {
+        "general.architecture": (GGUF_TYPE_STRING, "wespeaker_resnet34"),
+        "general.name": (GGUF_TYPE_STRING, "pyannote-embedding-community-1"),
+        "general.alignment": (GGUF_TYPE_UINT32, GGUF_DEFAULT_ALIGNMENT),
+        "wespeaker.sample_rate": (GGUF_TYPE_UINT32, 16000),
+        "wespeaker.num_mel_bins": (GGUF_TYPE_UINT32, 80),
+        "wespeaker.frame_length": (GGUF_TYPE_UINT32, 25),
+        "wespeaker.frame_shift": (GGUF_TYPE_UINT32, 10),
+        "wespeaker.embed_dim": (GGUF_TYPE_UINT32, 256),
+        "wespeaker.feat_dim": (GGUF_TYPE_UINT32, 80),
+    }
+
+    tensor_infos = []
+    current_offset = 0
+    for name, data in tensors.items():
+        ftype = GGML_TYPE_F16 if should_use_f16(name, data) else GGML_TYPE_F32
+        converted = np.ascontiguousarray(
+            data.astype(np.float16 if ftype == GGML_TYPE_F16 else np.float32)
+        )
+        tensor_infos.append(
+            {
+                "name": name,
+                "data": converted,
+                "ftype": ftype,
+                "offset": current_offset,
+            }
+        )
+        current_offset += align_offset(converted.nbytes)
+
+    with open(output_path, "wb") as f:
+        f.write(struct.pack("<I", GGUF_MAGIC))
+        f.write(struct.pack("<I", GGUF_VERSION))
+        f.write(struct.pack("<Q", len(tensor_infos)))
+        f.write(struct.pack("<Q", len(metadata)))
+
+        for key, (value_type, value) in metadata.items():
+            write_metadata_kv(f, key, value_type, value)
+
+        for info in tensor_infos:
+            write_gguf_string(f, info["name"])
+            data = info["data"]
+            n_dims = len(data.shape)
+            f.write(struct.pack("<I", n_dims))
+            for i in range(n_dims):
+                f.write(struct.pack("<Q", data.shape[n_dims - 1 - i]))
+            f.write(struct.pack("<I", info["ftype"]))
+            f.write(struct.pack("<Q", info["offset"]))
+
+        current_pos = f.tell()
+        aligned_pos = align_offset(current_pos)
+        if aligned_pos > current_pos:
+            f.write(b"\x00" * (aligned_pos - current_pos))
+
+        tensor_data_start = f.tell()
+        for info in tensor_infos:
+            data = info["data"]
+            target_pos = tensor_data_start + info["offset"]
+            current_pos = f.tell()
+            if target_pos > current_pos:
+                f.write(b"\x00" * (target_pos - current_pos))
+            data.tofile(f)
+            padding = align_offset(data.nbytes) - data.nbytes
+            if padding > 0:
+                f.write(b"\x00" * padding)
+
+    return tensor_infos
+
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: python convert_embedding_to_ggml.py <path_to_pytorch_model.bin> <output.gguf>")
+    parser = argparse.ArgumentParser(description="Convert WeSpeaker embedding checkpoint to GGUF")
+    parser.add_argument("model_path", help="Path to PyTorch checkpoint, usually embedding/pytorch_model.bin")
+    parser.add_argument("output_path", help="Path to output GGUF file")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Reduce logging")
+    args = parser.parse_args()
+
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        print(f"Error: model not found: {model_path}", file=sys.stderr)
         sys.exit(1)
 
-    model_path = sys.argv[1]
-    output_path = sys.argv[2]
+    print(f"Loading embedding checkpoint: {model_path}")
+    state_dict = load_state_dict(str(model_path))
+    print(f"Found {len(state_dict)} raw tensors")
 
-    print(f"Loading model from {model_path}")
-    checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-        state_dict = checkpoint['state_dict']
-    else:
-        state_dict = checkpoint
-
-    gguf_writer = gguf.GGUFWriter(output_path, "pyannote-embedding")
-
-    # Hyperparameters
-    # Input features: fbank 80 dim
-    gguf_writer.add_int32("fbank.n_mels", 80)
-    gguf_writer.add_int32("embedding.dim", 256) # Based on inspection, check seg_1 weight shape later
-
-    print("Converting weights...")
-    
-    # We need to iterate layers and fold BatchNorms.
-    # The structure is:
-    # resnet.conv1 (Conv2d)
-    # resnet.bn1 (BatchNorm2d)
-    # resnet.layerX.Y.conv1 (Conv2d)
-    # resnet.layerX.Y.bn1 (BatchNorm2d)
-    # ...
-    
-    # Helper to find bn params for a conv name
-    # e.g. conv_name = "resnet.conv1.weight" -> bn_prefix = "resnet.bn1"
-    # e.g. conv_name = "resnet.layer1.0.conv1.weight" -> bn_prefix = "resnet.layer1.0.bn1"
-    
-    def get_bn_prefix(conv_name):
-        parts = conv_name.split(".")
-        if parts[-1] == "weight":
-            parts = parts[:-1] # remove weight
-        
-        # Replace convX with bnX
-        if parts[-1].startswith("conv"):
-            parts[-1] = parts[-1].replace("conv", "bn")
-            return ".".join(parts)
-        return None
-
-    processed_keys = set()
-    
-    for k in state_dict.keys():
-        if k in processed_keys:
-            continue
-            
-        if "num_batches_tracked" in k:
-            continue
-            
-        v = state_dict[k]
-        
-        # Check if it's a Conv weight that has a corresponding BN
-        if "conv" in k and "weight" in k and v.dim() == 4:
-            bn_prefix = get_bn_prefix(k)
-            if bn_prefix and (bn_prefix + ".weight") in state_dict:
-                print(f"Folding BN {bn_prefix} into {k}")
-                
-                conv_w = v
-                conv_b = state_dict.get(k.replace("weight", "bias")) # Conv usually has no bias in ResNet
-                
-                bn_w = state_dict[bn_prefix + ".weight"]
-                bn_b = state_dict[bn_prefix + ".bias"]
-                bn_mean = state_dict[bn_prefix + ".running_mean"]
-                bn_var = state_dict[bn_prefix + ".running_var"]
-                
-                new_w, new_b = fold_batch_norm(conv_w, conv_b, bn_w, bn_b, bn_mean, bn_var)
-                
-                # Add to GGUF
-                # Store weights as F32
-                gguf_writer.add_tensor(k, new_w.numpy().astype(np.float32))
-                gguf_writer.add_tensor(k.replace("weight", "bias"), new_b.numpy().astype(np.float32))
-                
-                # Mark BN keys as processed
-                processed_keys.add(bn_prefix + ".weight")
-                processed_keys.add(bn_prefix + ".bias")
-                processed_keys.add(bn_prefix + ".running_mean")
-                processed_keys.add(bn_prefix + ".running_var")
-                processed_keys.add(k)
-                if conv_b is not None:
-                    processed_keys.add(k.replace("weight", "bias"))
-                continue
-        
-        # Downsample/Shortcut layers often have conv+bn too
-        # resnet.layer2.0.shortcut.0 (Conv)
-        # resnet.layer2.0.shortcut.1 (BN)
-        if "shortcut.0.weight" in k:
-            bn_prefix = k.replace("shortcut.0.weight", "shortcut.1")
-            if (bn_prefix + ".weight") in state_dict:
-                print(f"Folding BN {bn_prefix} into {k}")
-                
-                conv_w = v
-                conv_b = state_dict.get(k.replace("weight", "bias"))
-                
-                bn_w = state_dict[bn_prefix + ".weight"]
-                bn_b = state_dict[bn_prefix + ".bias"]
-                bn_mean = state_dict[bn_prefix + ".running_mean"]
-                bn_var = state_dict[bn_prefix + ".running_var"]
-                
-                new_w, new_b = fold_batch_norm(conv_w, conv_b, bn_w, bn_b, bn_mean, bn_var)
-                
-                gguf_writer.add_tensor(k, new_w.numpy().astype(np.float32))
-                gguf_writer.add_tensor(k.replace("weight", "bias"), new_b.numpy().astype(np.float32))
-                
-                processed_keys.add(bn_prefix + ".weight")
-                processed_keys.add(bn_prefix + ".bias")
-                processed_keys.add(bn_prefix + ".running_mean")
-                processed_keys.add(bn_prefix + ".running_var")
-                processed_keys.add(k)
-                continue
-
-        # Linear layers (seg_1, seg_2)
-        # resnet.seg_1.weight
-        # resnet.seg_1.bias
-        if "seg_" in k and "weight" in k:
-            # Check for seg_bn_1
-            # In ResNet init: if two_emb_layer: seg_1 -> relu -> seg_bn_1 -> seg_2
-            # seg_bn_1 is BatchNorm1d(embed_dim, affine=False). 
-            
-            print(f"Adding {k}, shape {v.shape}, type F32")
-            gguf_writer.add_tensor(k, v.numpy().astype(np.float32))
-            processed_keys.add(k)
-            continue
-            
-        if "seg_" in k and "bias" in k:
-            print(f"Adding {k}, shape {v.shape}, type F32")
-            gguf_writer.add_tensor(k, v.numpy().astype(np.float32))
-            processed_keys.add(k)
+    converted = {}
+    skipped = []
+    verbose = not args.quiet
+    for name, tensor in state_dict.items():
+        if "num_batches_tracked" in name:
+            skipped.append(name)
             continue
 
-        # Any other weights not processed
-        if k not in processed_keys:
-            # Ignore BN params that might have been skipped if logic wasn't perfect (safe fallback?)
-            # No, we should only add what we need.
-            # print(f"Skipping {k}")
-            pass
+        data = tensor.detach().cpu().numpy()
+        converted[name] = data
+        if verbose:
+            dtype_str = "F16" if should_use_f16(name, data) else "F32"
+            print(f"  {name:55s} {str(tuple(data.shape)):20s} -> {dtype_str}")
 
-    # --- VBx / PLDA Model integration ---
-    print("Checking for PLDA model files...")
-    # Assuming model_path is like ".../embedding/pytorch_model.bin"
-    # We look for ".../plda/xvec_transform.npz" and ".../plda/plda.npz"
-    
-    model_dir = Path(model_path).parent
-    snapshot_dir = model_dir.parent
-    plda_dir = snapshot_dir / "plda"
-    
-    path_to_transform = plda_dir / "xvec_transform.npz"
-    path_to_plda = plda_dir / "plda.npz"
-    
-    if path_to_transform.exists() and path_to_plda.exists():
-        print(f"Found PLDA files at {plda_dir}")
-        try:
-            x = np.load(path_to_transform)
-            mean1, mean2, lda = x["mean1"], x["mean2"], x["lda"]
+    infos = write_gguf(args.output_path, converted)
+    f16_count = sum(1 for info in infos if info["ftype"] == GGML_TYPE_F16)
+    f32_count = len(infos) - f16_count
 
-            p = np.load(path_to_plda)
-            plda_mu, plda_tr, plda_psi = p["mu"], p["tr"], p["psi"]
-            
-            # Compute final VBx matrices
-            # within-class, between-class matrices (W, B)
-            W_mat = np.linalg.inv(plda_tr.T.dot(plda_tr))
-            B_mat = np.linalg.inv((plda_tr.T / plda_psi).dot(plda_tr))
+    print(f"Wrote {args.output_path}")
+    print(f"  tensors: {len(infos)}")
+    print(f"  skipped num_batches_tracked: {len(skipped)}")
+    print(f"  f16: {f16_count}")
+    print(f"  f32: {f32_count}")
 
-            # Solve generalized eigenvalue problem
-            acvar, wccn = eigh(B_mat, W_mat)
-            plda_psi_final = acvar[::-1]
-            plda_tr_final = wccn.T[::-1]
-            
-            print("Adding VBx/PLDA tensors to GGUF...")
-            gguf_writer.add_tensor("vbx.mean1", mean1.astype(np.float32))
-            gguf_writer.add_tensor("vbx.mean2", mean2.astype(np.float32))
-            gguf_writer.add_tensor("vbx.lda", lda.astype(np.float32))
-            gguf_writer.add_tensor("vbx.plda_mu", plda_mu.astype(np.float32))
-            gguf_writer.add_tensor("vbx.plda_tr", plda_tr_final.astype(np.float32))
-            gguf_writer.add_tensor("vbx.plda_psi", plda_psi_final.astype(np.float32))
-            
-        except Exception as e:
-            print(f"Error processing PLDA files: {e}")
-    else:
-        print(f"PLDA files not found in {plda_dir}. Skipping VBx integration.")
-
-
-    print("Writing GGUF file...")
-    gguf_writer.write_header_to_file()
-    gguf_writer.write_kv_data_to_file()
-    gguf_writer.write_tensors_to_file()
-    gguf_writer.close()
-    print(f"Model saved to {output_path}")
 
 if __name__ == "__main__":
     main()

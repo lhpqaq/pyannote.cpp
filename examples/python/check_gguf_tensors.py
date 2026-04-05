@@ -1,22 +1,43 @@
-import gguf
+#!/usr/bin/env python3
+
+import argparse
 import sys
 
-if len(sys.argv) < 2:
-    print("Usage: python check_gguf_tensors.py <model.gguf>")
-    sys.exit(1)
 
-model_path = sys.argv[1]
-reader = gguf.GGUFReader(model_path)
+def main():
+    parser = argparse.ArgumentParser(description="Inspect tensor groups inside a GGUF file")
+    parser.add_argument("model_path", help="Path to GGUF file")
+    args = parser.parse_args()
 
-print(f"Tensors in {model_path}:")
-found_vbx = False
-for tensor in reader.tensors:
-    if tensor.name.startswith("vbx."):
-        print(f"  {tensor.name} | shape: {tensor.shape}")
-        found_vbx = True
+    import gguf
 
-if found_vbx:
-    print("\nVBx tensors FOUND.")
-else:
-    print("\nVBx tensors NOT FOUND.")
+    model_path = args.model_path
+    reader = gguf.GGUFReader(model_path)
 
+    groups = {
+        "segmentation": [],
+        "embedding": [],
+        "plda": [],
+        "other": [],
+    }
+
+    for tensor in reader.tensors:
+        name = tensor.name
+        if name.startswith("sincnet.") or name.startswith("lstm.") or name.startswith("linear.") or name.startswith("classifier."):
+            groups["segmentation"].append((name, tensor.shape))
+        elif name.startswith("resnet."):
+            groups["embedding"].append((name, tensor.shape))
+        elif name.startswith("plda."):
+            groups["plda"].append((name, tensor.shape))
+        else:
+            groups["other"].append((name, tensor.shape))
+
+    print(f"Tensors in {model_path}:")
+    for group_name, tensors in groups.items():
+        print(f"\n[{group_name}] count={len(tensors)}")
+        for name, shape in tensors:
+            print(f"  {name} | shape: {shape}")
+
+
+if __name__ == "__main__":
+    main()

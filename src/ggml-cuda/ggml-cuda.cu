@@ -34,6 +34,7 @@
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
 #include "ggml-cuda/pad.cuh"
+#include "ggml-cuda/pool1d.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/quantize.cuh"
 #include "ggml-cuda/rope.cuh"
@@ -62,6 +63,8 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -70,6 +73,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <float.h>
 #include <initializer_list>
 #include <limits>
@@ -83,6 +87,243 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+static __device__ __forceinline__ float seg_sigmoidf(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+template <typename T>
+static __device__ __forceinline__ float seg_load_f32(const T * p, int idx);
+
+template <>
+__device__ __forceinline__ float seg_load_f32<float>(const float * p, int idx) {
+    return p[idx];
+}
+
+template <>
+__device__ __forceinline__ float seg_load_f32<half>(const half * p, int idx) {
+    return __half2float(p[idx]);
+}
+
+static __global__ void k_f32_to_f16(const int n, const float * x, half * y) {
+    const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        y[i] = __float2half_rn(x[i]);
+    }
+}
+
+template <bool REVERSE, typename W_T, typename B_T>
+static __global__ void k_pyannote_seg_lstm_dir_t(
+    const int T,
+    const int H,
+    const float * __restrict__ ih_all,
+    const W_T   * __restrict__ w_hh,
+    const B_T   * __restrict__ b_ih,
+    const B_T   * __restrict__ b_hh,
+    float       * __restrict__ dst,
+    const int dir_off) {
+
+    extern __shared__ float sh[];
+    float * h_prev = sh;
+    float * c_prev = sh + H;
+    float * gates  = sh + 2 * H;
+
+    const int tid = (int) threadIdx.x;
+    const int G = 4 * H;
+
+    for (int i = tid; i < H; i += blockDim.x) {
+        h_prev[i] = 0.0f;
+        c_prev[i] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int step = 0; step < T; ++step) {
+        const int t = REVERSE ? (T - 1 - step) : step;
+
+        for (int g = tid; g < G; g += blockDim.x) {
+            float dot = 0.0f;
+            const int col = g * H;
+            for (int k = 0; k < H; ++k) {
+                dot += seg_load_f32<W_T>(w_hh, col + k) * h_prev[k];
+            }
+            const float bias = seg_load_f32<B_T>(b_ih, g) + seg_load_f32<B_T>(b_hh, g);
+            gates[g] = ih_all[g + t * G] + dot + bias;
+        }
+
+        __syncthreads();
+
+        for (int h = tid; h < H; h += blockDim.x) {
+            const float i_val = seg_sigmoidf(gates[h]);
+            const float f_val = seg_sigmoidf(gates[H + h]);
+            const float g_val = tanhf(gates[2 * H + h]);
+            const float o_val = seg_sigmoidf(gates[3 * H + h]);
+
+            const float c_new = f_val * c_prev[h] + i_val * g_val;
+            const float h_new = o_val * tanhf(c_new);
+
+            c_prev[h] = c_new;
+            h_prev[h] = h_new;
+            dst[(dir_off + h) * T + t] = h_new;
+        }
+
+        __syncthreads();
+    }
+}
+
+static bool ggml_cuda_is_pyannote_seg_lstm_custom(const ggml_tensor * op) {
+    if (!op || op->op != GGML_OP_CUSTOM) {
+        return false;
+    }
+    for (int i = 0; i < 9; ++i) {
+        if (!op->src[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * x = op->src[0];
+    const ggml_tensor * w_ih = op->src[1];
+    const ggml_tensor * w_hh = op->src[2];
+    const ggml_tensor * b_ih = op->src[3];
+    const ggml_tensor * b_hh = op->src[4];
+    const ggml_tensor * w_ih_r = op->src[5];
+    const ggml_tensor * w_hh_r = op->src[6];
+    const ggml_tensor * b_ih_r = op->src[7];
+    const ggml_tensor * b_hh_r = op->src[8];
+
+    if (x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (x->ne[2] != 1 || op->ne[2] != 1) {
+        return false;
+    }
+
+    if (w_ih->type != GGML_TYPE_F16 || w_hh->type != GGML_TYPE_F16 ||
+        w_ih_r->type != GGML_TYPE_F16 || w_hh_r->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (b_ih->type != GGML_TYPE_F32 && b_ih->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (b_hh->type != b_ih->type || b_ih_r->type != b_ih->type || b_hh_r->type != b_ih->type) {
+        return false;
+    }
+
+    const int H = (int) w_hh->ne[0];
+    const int G = 4 * H;
+    if (w_hh->ne[1] != G || w_hh_r->ne[0] != H || w_hh_r->ne[1] != G) {
+        return false;
+    }
+    if (b_ih->ne[0] != G || b_hh->ne[0] != G || b_ih_r->ne[0] != G || b_hh_r->ne[0] != G) {
+        return false;
+    }
+    if (op->ne[0] != x->ne[0] || op->ne[1] != 2 * H) {
+        return false;
+    }
+    if (::strncmp(w_ih->name, "lstm.weight_ih_l", 16) != 0) {
+        return false;
+    }
+    if (::strncmp(w_hh->name, "lstm.weight_hh_l", 16) != 0) {
+        return false;
+    }
+    if (::strstr(w_ih_r->name, "_reverse") == nullptr || ::strstr(w_hh_r->name, "_reverse") == nullptr) {
+        return false;
+    }
+
+    return true;
+}
+
+static void ggml_cuda_pyannote_seg_lstm_custom(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x      = dst->src[0];
+    const ggml_tensor * w_ih   = dst->src[1];
+    const ggml_tensor * w_hh   = dst->src[2];
+    const ggml_tensor * b_ih   = dst->src[3];
+    const ggml_tensor * b_hh   = dst->src[4];
+    const ggml_tensor * w_ih_r = dst->src[5];
+    const ggml_tensor * w_hh_r = dst->src[6];
+    const ggml_tensor * b_ih_r = dst->src[7];
+    const ggml_tensor * b_hh_r = dst->src[8];
+
+    const int T = (int) x->ne[0];
+    const int in = (int) x->ne[1];
+    const int H = (int) w_hh->ne[0];
+    const int G = 4 * H;
+
+    cudaStream_t stream = ctx.stream();
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+
+    ggml_cuda_pool_alloc<float> ih_fwd(ctx.pool());
+    ggml_cuda_pool_alloc<float> ih_rev(ctx.pool());
+    ih_fwd.alloc((size_t) G * (size_t) T);
+    ih_rev.alloc((size_t) G * (size_t) T);
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+
+    const float * x_d = (const float *) x->data;
+    ggml_cuda_pool_alloc<half> x_h(ctx.pool());
+    x_h.alloc((size_t) T * (size_t) in);
+
+    {
+        const int n = T * in;
+        const int bs = 256;
+        const int gs = (n + bs - 1) / bs;
+        k_f32_to_f16<<<gs, bs, 0, stream>>>(n, x_d, x_h.get());
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const half * wih_f_d = (const half *) w_ih->data;
+    const half * wih_r_d = (const half *) w_ih_r->data;
+
+    CUBLAS_CHECK(cublasGemmEx(
+        handle,
+        CUBLAS_OP_T, CUBLAS_OP_T,
+        G, T, in,
+        &alpha,
+        wih_f_d, CUDA_R_16F, in,
+        x_h.get(), CUDA_R_16F, T,
+        &beta,
+        ih_fwd.get(), CUDA_R_32F, G,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    CUBLAS_CHECK(cublasGemmEx(
+        handle,
+        CUBLAS_OP_T, CUBLAS_OP_T,
+        G, T, in,
+        &alpha,
+        wih_r_d, CUDA_R_16F, in,
+        x_h.get(), CUDA_R_16F, T,
+        &beta,
+        ih_rev.get(), CUDA_R_32F, G,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    float * out = (float *) dst->data;
+    const half * whh_f_d = (const half *) w_hh->data;
+    const half * whh_r_d = (const half *) w_hh_r->data;
+
+    const int threads = 512;
+    const dim3 block(threads);
+    const dim3 grid(1);
+    const size_t shmem = (size_t) (6 * H) * sizeof(float);
+
+    if (b_ih->type == GGML_TYPE_F16) {
+        const half * b_ih_d = (const half *) b_ih->data;
+        const half * b_hh_d = (const half *) b_hh->data;
+        const half * b_ih_rd = (const half *) b_ih_r->data;
+        const half * b_hh_rd = (const half *) b_hh_r->data;
+        k_pyannote_seg_lstm_dir_t<false, half, half><<<grid, block, shmem, stream>>>(T, H, ih_fwd.get(), whh_f_d, b_ih_d, b_hh_d, out, 0);
+        k_pyannote_seg_lstm_dir_t<true,  half, half><<<grid, block, shmem, stream>>>(T, H, ih_rev.get(), whh_r_d, b_ih_rd, b_hh_rd, out, H);
+    } else {
+        const float * b_ih_d = (const float *) b_ih->data;
+        const float * b_hh_d = (const float *) b_hh->data;
+        const float * b_ih_rd = (const float *) b_ih_r->data;
+        const float * b_hh_rd = (const float *) b_hh_r->data;
+        k_pyannote_seg_lstm_dir_t<false, half, float><<<grid, block, shmem, stream>>>(T, H, ih_fwd.get(), whh_f_d, b_ih_d, b_hh_d, out, 0);
+        k_pyannote_seg_lstm_dir_t<true,  half, float><<<grid, block, shmem, stream>>>(T, H, ih_rev.get(), whh_r_d, b_ih_rd, b_hh_rd, out, H);
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -2681,6 +2922,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_CONV_TRANSPOSE_1D:
             ggml_cuda_op_conv_transpose_1d(ctx,dst);
             break;
+        case GGML_OP_POOL_1D:
+            ggml_cuda_op_pool1d(ctx, dst);
+            break;
         case GGML_OP_POOL_2D:
             ggml_cuda_op_pool2d(ctx, dst);
             break;
@@ -2741,6 +2985,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;
+        case GGML_OP_CUSTOM:
+            if (ggml_cuda_is_pyannote_seg_lstm_custom(dst)) {
+                ggml_cuda_pyannote_seg_lstm_custom(ctx, dst);
+                break;
+            }
+            return false;
         default:
             return false;
     }
@@ -4612,6 +4862,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CONV_2D:
         case GGML_OP_CONV_2D_DW:
         case GGML_OP_CONV_TRANSPOSE_2D:
+        case GGML_OP_POOL_1D:
         case GGML_OP_POOL_2D:
         case GGML_OP_ACC:
             return true;
@@ -4650,6 +4901,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_is_pyannote_seg_lstm_custom(op);
 
         default:
             return false;

@@ -1,5 +1,7 @@
 #include "binbcast.cuh"
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <utility>
 
 static __device__ __forceinline__ float op_repeat(const float a, const float b) {
@@ -39,15 +41,15 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
                                    const uint3            ne11,
                                    const uint3            ne12,
                                    const uint3            ne13,
-                                   /*int s0, */ const int s1,
-                                   const int              s2,
-                                   const int              s3,
-                                   /*int s00,*/ const int s01,
-                                   const int              s02,
-                                   const int              s03,
-                                   /*int s10,*/ const int s11,
-                                   const int              s12,
-                                   const int              s13,
+                                   /*int64_t s0, */ const int64_t s1,
+                                   const int64_t                s2,
+                                   const int64_t                s3,
+                                   /*int64_t s00,*/ const int64_t s01,
+                                   const int64_t                s02,
+                                   const int64_t                s03,
+                                   /*int64_t s10,*/ const int64_t s11,
+                                   const int64_t                s12,
+                                   const int64_t                s13,
                                    src1_ptrs... src1s) {
     const uint32_t i0s = blockDim.x * blockIdx.x + threadIdx.x;
     const uint32_t i1  = (blockDim.y * blockIdx.y + threadIdx.y);
@@ -62,11 +64,12 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
     const uint32_t i12 = fastmodulo(i2, ne12);
     const uint32_t i13 = fastmodulo(i3, ne13);
 
-    const size_t i_src0 =  i3*s03 +  i2*s02 +  i1*s01;
-    const size_t i_src1 = i13*s13 + i12*s12 + i11*s11;
-    const size_t i_dst  =  i3*s3  +  i2*s2  +  i1*s1;
+    const int64_t i_src0 =  (int64_t) i3*s03 +  (int64_t) i2*s02 +  (int64_t) i1*s01;
+    const int64_t i_src1 = (int64_t)i13*s13 + (int64_t)i12*s12 + (int64_t)i11*s11;
+    const int64_t i_dst  =  (int64_t) i3*s3  +  (int64_t) i2*s2  +  (int64_t) i1*s1;
 
     const src0_t * src0_row = src0 ? (src0 + i_src0) : nullptr;
+    const src1_t * src1_row = src1 ? (src1 + i_src1) : nullptr;
     dst_t * dst_row = dst + i_dst;
 
     for (int i0 = i0s; i0 < ne0; i0 += blockDim.x * gridDim.x) {
@@ -76,7 +79,7 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
         if constexpr (sizeof...(src1_ptrs) > 0) {
             result = (..., (result = bin_op(result, (float)src1s[i_src1 + i10])));
         } else {
-            result = bin_op(result, (float)src1[i_src1 + i10]);
+            result = bin_op(result, (float)src1_row[i10]);
         }
 
         dst_row[i0] = (dst_t) result;
@@ -101,15 +104,15 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
                                            const uint3            ne11,
                                            const uint3            ne12,
                                            const uint3            ne13,
-                                           /*int s0, */ const int s1,
-                                           const int              s2,
-                                           const int              s3,
-                                           /*int s00,*/ const int s01,
-                                           const int              s02,
-                                           const int              s03,
-                                           /*int s10,*/ const int s11,
-                                           const int              s12,
-                                           const int              s13,
+                                           /*int64_t s0, */ const int64_t s1,
+                                           const int64_t                s2,
+                                           const int64_t                s3,
+                                           /*int64_t s00,*/ const int64_t s01,
+                                           const int64_t                s02,
+                                           const int64_t                s03,
+                                           /*int64_t s10,*/ const int64_t s11,
+                                           const int64_t                s12,
+                                           const int64_t                s13,
                                            src1_ptrs... src1s) {
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -126,11 +129,12 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
     const int i12 = fastmodulo(i2, ne12);
     const int i13 = fastmodulo(i3, ne13);
 
-    const size_t i_src0 =  i3*s03 +  i2*s02 +  i1*s01;
-    const size_t i_src1 = i13*s13 + i12*s12 + i11*s11;
-    const size_t i_dst  =  i3*s3  +  i2*s2  +  i1*s1;
+    const int64_t i_src0 =  (int64_t) i3*s03 +  (int64_t) i2*s02 +  (int64_t) i1*s01;
+    const int64_t i_src1 = (int64_t)i13*s13 + (int64_t)i12*s12 + (int64_t)i11*s11;
+    const int64_t i_dst  =  (int64_t) i3*s3  +  (int64_t) i2*s2  +  (int64_t) i1*s1;
 
     const src0_t * src0_row = src0 ? (src0 + i_src0) : nullptr;
+    const src1_t * src1_row = src1 ? (src1 + i_src1) : nullptr;
     dst_t * dst_row = dst + i_dst;
 
     const int i10 = fastmodulo(i0, ne10);
@@ -139,7 +143,7 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
     if constexpr (sizeof...(src1_ptrs) > 0) {
         result = (..., (result = bin_op(result, (float)src1s[i_src1 + i10])));
     } else {
-        result = bin_op(result, (float)src1[i_src1 + i10]);
+        result = bin_op(result, (float)src1_row[i10]);
     }
 
     dst_row[i0] = (dst_t) result;

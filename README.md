@@ -61,6 +61,12 @@ python examples/python/convert_pyannote_to_ggml.py \
 python examples/python/convert_embedding_to_ggml.py \
   models/embedding/pytorch_model.bin \
   models/pyannote-embedding.gguf
+
+# Convert PLDA model
+python examples/python/convert_plda_to_gguf.py \
+  --transform-npz models/plda/xvec_transform.npz \
+  --plda-npz models/plda/plda.npz \
+  -o models/plda.gguf
 ```
 
 #### 2. Build
@@ -77,7 +83,7 @@ cmake ..
 make -j$(sysctl -n hw.ncpu)
 ```
 
-**Note**: Currently only CPU backend is supported. GPU acceleration (CUDA, Metal, Vulkan) support is planned for future releases.
+**Note**: The offline CLI is the supported entry point. Backend availability depends on your local `ggml` build configuration and platform.
 
 #### 3. Run Inference
 
@@ -85,7 +91,9 @@ make -j$(sysctl -n hw.ncpu)
 ./build/bin/pyannote-diarization \
   models/pyannote-segmentation.gguf \
   models/pyannote-embedding.gguf \
-  audio.wav
+  audio.wav \
+  --plda models/plda.gguf \
+  --output output.rttm
 ```
 
 **Note**: Input audio must be 16kHz WAV format.
@@ -111,18 +119,6 @@ pyannote.cpp/
 │   └── CMakeLists.txt
 ├── models/            # converted GGUF models (you create this)
 └── CMakeLists.txt
-```
-
-### Advanced Usage
-
-#### Streaming Mode
-
-For real-time processing:
-```bash
-./build/bin/pyannote-diarization-streaming \
-  models/pyannote-segmentation.gguf \
-  models/pyannote-embedding.gguf \
-  audio.wav
 ```
 
 ### License
@@ -197,6 +193,11 @@ python examples/python/convert_pyannote_to_ggml.py \
 python examples/python/convert_embedding_to_ggml.py \
   models/embedding/pytorch_model.bin \
   models/pyannote-embedding.gguf
+
+python examples/python/convert_plda_to_gguf.py \
+  --transform-npz models/plda/xvec_transform.npz \
+  --plda-npz models/plda/plda.npz \
+  -o models/plda.gguf
 ```
 
 #### 2. 编译
@@ -213,7 +214,7 @@ cmake ..
 make -j$(sysctl -n hw.ncpu)
 ```
 
-**注意**：当前仅支持 CPU backend。GPU 加速（CUDA、Metal、Vulkan）支持计划在未来版本中实现。
+**注意**：当前对外支持的入口是离线 CLI。具体 backend 是否可用，取决于你本地的 `ggml` 编译配置和平台。
 
 #### 3. 运行推理
 
@@ -221,7 +222,9 @@ make -j$(sysctl -n hw.ncpu)
 ./build/bin/pyannote-diarization \
   models/pyannote-segmentation.gguf \
   models/pyannote-embedding.gguf \
-  audio.wav
+  audio.wav \
+  --plda models/plda.gguf \
+  --output output.rttm
 ```
 
 **注意**：输入音频必须是 16kHz WAV 格式。
@@ -247,18 +250,6 @@ pyannote.cpp/
 │   └── CMakeLists.txt
 ├── models/            # 转换后的 GGUF 模型（需自行创建）
 └── CMakeLists.txt
-```
-
-### 高级用法
-
-#### 流式模式
-
-用于实时处理：
-```bash
-./build/bin/pyannote-diarization-streaming \
-  models/pyannote-segmentation.gguf \
-  models/pyannote-embedding.gguf \
-  audio.wav
 ```
 
 ### 许可证
