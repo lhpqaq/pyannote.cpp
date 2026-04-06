@@ -16,6 +16,8 @@ static void print_usage(const char * program) {
     fprintf(stderr, "  --plda <path>         Path to PLDA GGUF file\n");
     fprintf(stderr, "  --coreml <path>       Path to CoreML embedding model (.mlpackage)\n");
     fprintf(stderr, "  --seg-coreml <path>   Path to CoreML segmentation model (.mlpackage)\n");
+    fprintf(stderr, "  --backend <name>      GGML backend: cpu | cuda | auto\n");
+    fprintf(stderr, "  --gpu-device <id>     CUDA device index (default: 0)\n");
     fprintf(stderr, "  -o, --output <path>   Output RTTM file (default: stdout)\n");
     fprintf(stderr, "  --dump-stage <name>   Dump intermediate stage to binary file\n");
     fprintf(stderr, "  --help                Print this help message\n");
@@ -29,6 +31,26 @@ static bool consume_value(int argc, char ** argv, int & i, const char * option, 
     }
 
     value = argv[++i];
+    return true;
+}
+
+static bool consume_int_value(int argc, char ** argv, int & i, const char * option, int & value) {
+    if (i + 1 >= argc) {
+        fprintf(stderr, "Error: option '%s' requires a value\n\n", option);
+        print_usage(argv[0]);
+        return false;
+    }
+
+    const char * raw = argv[++i];
+    char * end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (!end || *end != '\0') {
+        fprintf(stderr, "Error: option '%s' expects an integer, got '%s'\n\n", option, raw);
+        print_usage(argv[0]);
+        return false;
+    }
+
+    value = static_cast<int>(parsed);
     return true;
 }
 
@@ -67,6 +89,14 @@ int main(int argc, char ** argv) {
             }
         } else if (arg == "--seg-coreml") {
             if (!consume_value(argc, argv, i, "--seg-coreml", config.seg_coreml_path)) {
+                return 1;
+            }
+        } else if (arg == "--backend") {
+            if (!consume_value(argc, argv, i, "--backend", config.ggml_backend)) {
+                return 1;
+            }
+        } else if (arg == "--gpu-device") {
+            if (!consume_int_value(argc, argv, i, "--gpu-device", config.ggml_gpu_device)) {
                 return 1;
             }
         } else if (arg == "-o" || arg == "--output") {

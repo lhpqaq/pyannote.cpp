@@ -243,6 +243,11 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_libraries(ggml PRIVATE dl)
 endif()
 
+set(KALDI_NATIVE_FBANK_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+set(KALDI_NATIVE_FBANK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(KALDI_NATIVE_FBANK_ENABLE_CHECK OFF CACHE BOOL "" FORCE)
+add_subdirectory(../third_party/kaldi-native-fbank third_party/kaldi-native-fbank EXCLUDE_FROM_ALL)
+
 add_subdirectory(pyannote)
 
 function(ggml_add_backend_library backend)

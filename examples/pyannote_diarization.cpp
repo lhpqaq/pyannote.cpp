@@ -111,6 +111,8 @@ bool write_rttm(const DiarizationResult & result,
     internal.seg_coreml_path = config.seg_coreml_path;
     internal.output_path = null_sink_path();
     internal.dump_stage = config.dump_stage;
+    internal.ggml_backend = config.ggml_backend;
+    internal.ggml_gpu_device = config.ggml_gpu_device;
     return internal;
 }
 

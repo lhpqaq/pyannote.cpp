@@ -1,0 +1,3 @@
+[submodule "embedding-ggml/kaldi-native-fbank"]
+        path = third_party/kaldi-native-fbank
+        url = https://github.com/csukuangfj/kaldi-native-fbank

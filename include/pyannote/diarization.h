@@ -3,8 +3,6 @@
 #include <string>
 #include <vector>
 
-namespace pyannote_example {
-
 struct DiarizationConfig {
     std::string seg_model_path;
     std::string emb_model_path;
@@ -16,6 +14,7 @@ struct DiarizationConfig {
     std::string dump_stage;
     std::string ggml_backend = "cpu";
     int ggml_gpu_device = 0;
+    bool bypass_embeddings = false;
 };
 
 struct DiarizationResult {
@@ -28,6 +27,8 @@ struct DiarizationResult {
     std::vector<Segment> segments;
 };
 
-bool diarize_file(const DiarizationConfig & config, DiarizationResult & result);
-
-}  // namespace pyannote_example
+bool diarize(const DiarizationConfig & config, DiarizationResult & result);
+bool diarize_from_samples(const DiarizationConfig & config,
+                          const float * audio,
+                          int n_samples,
+                          DiarizationResult & result);
