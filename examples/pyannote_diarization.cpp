@@ -113,6 +113,11 @@ bool write_rttm(const DiarizationResult & result,
     internal.dump_stage = config.dump_stage;
     internal.ggml_backend = config.ggml_backend;
     internal.ggml_gpu_device = config.ggml_gpu_device;
+    internal.seg_lstm_coop = config.seg_lstm_coop;
+    internal.seg_lstm_coop_warp = config.seg_lstm_coop_warp;
+    internal.seg_lstm_coop_warps = config.seg_lstm_coop_warps;
+    internal.seg_lstm_coop_warp_nosh = config.seg_lstm_coop_warp_nosh;
+    internal.seg_lstm_coop_bidir = config.seg_lstm_coop_bidir;
     return internal;
 }
 

@@ -18,6 +18,15 @@ static void print_usage(const char * program) {
     fprintf(stderr, "  --seg-coreml <path>   Path to CoreML segmentation model (.mlpackage)\n");
     fprintf(stderr, "  --backend <name>      GGML backend: cpu | cuda | auto\n");
     fprintf(stderr, "  --gpu-device <id>     CUDA device index (default: 0)\n");
+    fprintf(stderr, "  --seg-lstm-coop-warps <n>\n");
+    fprintf(stderr, "                        CUDA bidirectional LSTM warp groups (default: 4)\n");
+    fprintf(stderr, "  --no-seg-lstm-coop    Disable CUDA fused segmentation LSTM custom op\n");
+    fprintf(stderr, "  --no-seg-lstm-coop-warp\n");
+    fprintf(stderr, "                        Disable warp-tuned CUDA launch for segmentation LSTM\n");
+    fprintf(stderr, "  --no-seg-lstm-coop-warp-nosh\n");
+    fprintf(stderr, "                        Disable the no-shared-memory launch preference flag\n");
+    fprintf(stderr, "  --no-seg-lstm-coop-bidir\n");
+    fprintf(stderr, "                        Disable CUDA bidirectional fused handling for segmentation LSTM\n");
     fprintf(stderr, "  -o, --output <path>   Output RTTM file (default: stdout)\n");
     fprintf(stderr, "  --dump-stage <name>   Dump intermediate stage to binary file\n");
     fprintf(stderr, "  --help                Print this help message\n");
@@ -99,6 +108,23 @@ int main(int argc, char ** argv) {
             if (!consume_int_value(argc, argv, i, "--gpu-device", config.ggml_gpu_device)) {
                 return 1;
             }
+        } else if (arg == "--seg-lstm-coop-warps") {
+            if (!consume_int_value(argc, argv, i, "--seg-lstm-coop-warps", config.seg_lstm_coop_warps)) {
+                return 1;
+            }
+            if (config.seg_lstm_coop_warps <= 0) {
+                fprintf(stderr, "Error: option '--seg-lstm-coop-warps' expects a positive integer\n\n");
+                print_usage(argv[0]);
+                return 1;
+            }
+        } else if (arg == "--no-seg-lstm-coop") {
+            config.seg_lstm_coop = false;
+        } else if (arg == "--no-seg-lstm-coop-warp") {
+            config.seg_lstm_coop_warp = false;
+        } else if (arg == "--no-seg-lstm-coop-warp-nosh") {
+            config.seg_lstm_coop_warp_nosh = false;
+        } else if (arg == "--no-seg-lstm-coop-bidir") {
+            config.seg_lstm_coop_bidir = false;
         } else if (arg == "-o" || arg == "--output") {
             if (!consume_value(argc, argv, i, arg.c_str(), config.output_path)) {
                 return 1;

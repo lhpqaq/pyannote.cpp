@@ -81,18 +81,6 @@ struct BackendState {
     ggml_backend_t preferred_gpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
     std::vector<uint8_t> graph_meta;
-    ggml_context * graph_ctx = nullptr;
-    ggml_cgraph * graph = nullptr;
-    ggml_tensor * input = nullptr;
-    ggml_tensor * output = nullptr;
-    ggml_tensor * aux0 = nullptr;
-    ggml_tensor * aux1 = nullptr;
-    ggml_tensor * aux2 = nullptr;
-    ggml_tensor * aux3 = nullptr;
-    ggml_tensor * aux4 = nullptr;
-    int cached_frames = -1;
-    std::vector<float> scratch_fbank;
-    std::vector<float> scratch_ones;
 };
 
 struct WeightStore {
@@ -165,12 +153,33 @@ struct FbankData {
 
 void apply_cmn(float * data, int frames);
 
-struct LstmOpParams {
-    int hidden = 0;
+enum : uintptr_t {
+    kSegLstmFlagCoop      = 1u << 0,
+    kSegLstmFlagWarp      = 1u << 1,
+    kSegLstmFlagWarpNoSh  = 1u << 2,
+    kSegLstmFlagBidir     = 1u << 3,
+    kSegLstmWarpShift     = 8,
+    kSegLstmWarpMask      = 0xffu << kSegLstmWarpShift,
 };
 
-static LstmOpParams g_lstm_params[4];
-static int g_lstm_layer_index = 0;
+uintptr_t pack_seg_lstm_cuda_options(const DiarizationConfig & config) {
+    uintptr_t packed = 0;
+    if (config.seg_lstm_coop) {
+        packed |= kSegLstmFlagCoop;
+    }
+    if (config.seg_lstm_coop_warp) {
+        packed |= kSegLstmFlagWarp;
+    }
+    if (config.seg_lstm_coop_warp_nosh) {
+        packed |= kSegLstmFlagWarpNoSh;
+    }
+    if (config.seg_lstm_coop_bidir) {
+        packed |= kSegLstmFlagBidir;
+    }
+    const int warps = std::clamp(config.seg_lstm_coop_warps, 1, 255);
+    packed |= static_cast<uintptr_t>(warps) << kSegLstmWarpShift;
+    return packed;
+}
 
 std::string basename_without_ext(const std::string & path) {
     std::string name = path;
@@ -773,22 +782,6 @@ bool init_backend_state(BackendState & state,
 }
 
 void free_backend_state(BackendState & state) {
-    if (state.graph_ctx) {
-        ggml_free(state.graph_ctx);
-        state.graph_ctx = nullptr;
-    }
-    state.graph = nullptr;
-    state.input = nullptr;
-    state.output = nullptr;
-    state.aux0 = nullptr;
-    state.aux1 = nullptr;
-    state.aux2 = nullptr;
-    state.aux3 = nullptr;
-    state.aux4 = nullptr;
-    state.cached_frames = -1;
-    state.scratch_fbank.clear();
-    state.scratch_ones.clear();
-
     if (state.sched) {
         ggml_backend_sched_free(state.sched);
         state.sched = nullptr;
@@ -922,7 +915,7 @@ void cpu_lstm_direction(float * dst,
     }
 }
 
-void lstm_custom_op(ggml_tensor * dst, int ith, int nth, void *) {
+void pyannote_seg_bilstm_op(ggml_tensor * dst, int ith, int nth, void *) {
     if (ith != 0) {
         return;
     }
@@ -957,11 +950,23 @@ ggml_tensor * bidirectional_lstm_layer(ggml_context * ctx,
                                        ggml_tensor * w_ih_r,
                                        ggml_tensor * w_hh_r,
                                        ggml_tensor * b_ih_r,
-                                       ggml_tensor * b_hh_r) {
+                                       ggml_tensor * b_hh_r,
+                                       uintptr_t cuda_options) {
     ggml_tensor * srcs[] = {input, w_ih, w_hh, b_ih, b_hh, w_ih_r, w_hh_r, b_ih_r, b_hh_r};
     const int seq_len = static_cast<int>(input->ne[0]);
     const int hidden = static_cast<int>(w_hh->ne[0]);
-    ggml_tensor * out = ggml_custom_4d(ctx, GGML_TYPE_F32, seq_len, 2 * hidden, 1, 1, srcs, 9, lstm_custom_op, 2, &g_lstm_params[g_lstm_layer_index++ % 4]);
+    ggml_tensor * out = ggml_custom_4d(ctx,
+                                       GGML_TYPE_F32,
+                                       seq_len,
+                                       2 * hidden,
+                                       1,
+                                       1,
+                                       srcs,
+                                       9,
+                                       pyannote_seg_bilstm_op,
+                                       2,
+                                       reinterpret_cast<void *>(cuda_options));
+    ggml_set_name(out, "pyannote_seg_bilstm");
     return out;
 }
 
@@ -1020,7 +1025,8 @@ ggml_tensor * classifier_layer(ggml_context * ctx,
 
 ggml_tensor * build_segmentation_forward(ggml_context * ctx,
                                          const SegmentationModel & model,
-                                         ggml_tensor * waveform) {
+                                         ggml_tensor * waveform,
+                                         uintptr_t seg_lstm_cuda_options) {
     ggml_tensor * x = waveform;
     if (model.wav_norm_weight && model.wav_norm_bias) {
         x = instance_norm_1d(ctx, x, model.wav_norm_weight, model.wav_norm_bias);
@@ -1030,7 +1036,6 @@ ggml_tensor * build_segmentation_forward(ggml_context * ctx,
     x = segmentation_conv_stage(ctx, x, model.sinc_conv_weight[1], model.sinc_conv_bias[1], model.sinc_norm_weight[1], model.sinc_norm_bias[1], 1, false);
     x = segmentation_conv_stage(ctx, x, model.sinc_conv_weight[2], model.sinc_conv_bias[2], model.sinc_norm_weight[2], model.sinc_norm_bias[2], 1, false);
 
-    g_lstm_layer_index = 0;
     for (int i = 0; i < 4; ++i) {
         x = bidirectional_lstm_layer(ctx,
                                      x,
@@ -1041,7 +1046,8 @@ ggml_tensor * build_segmentation_forward(ggml_context * ctx,
                                      model.lstm_weight_ih_rev[i],
                                      model.lstm_weight_hh_rev[i],
                                      model.lstm_bias_ih_rev[i],
-                                     model.lstm_bias_hh_rev[i]);
+                                     model.lstm_bias_hh_rev[i],
+                                     seg_lstm_cuda_options);
     }
 
     x = ggml_cont(ctx, x);
@@ -1051,7 +1057,9 @@ ggml_tensor * build_segmentation_forward(ggml_context * ctx,
     return classifier_layer(ctx, x, model.classifier_weight, model.classifier_bias);
 }
 
-ggml_cgraph * build_segmentation_graph(const SegmentationModel & model, BackendState & state) {
+ggml_cgraph * build_segmentation_graph(const SegmentationModel & model,
+                                       BackendState & state,
+                                       uintptr_t seg_lstm_cuda_options) {
     ggml_init_params params = {
         /*.mem_size   =*/ state.graph_meta.size(),
         /*.mem_buffer =*/ state.graph_meta.data(),
@@ -1066,34 +1074,19 @@ ggml_cgraph * build_segmentation_graph(const SegmentationModel & model, BackendS
     ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kChunkSamples, 1, 1);
     ggml_set_name(input, "waveform");
     ggml_set_input(input);
-    ggml_tensor * output = build_segmentation_forward(ctx, model, input);
+    ggml_tensor * output = build_segmentation_forward(ctx, model, input, seg_lstm_cuda_options);
     ggml_set_output(output);
     ggml_build_forward_expand(graph, output);
     ggml_free(ctx);
     return graph;
 }
 
-void reset_cached_graph(BackendState & state) {
-    if (state.graph_ctx) {
-        ggml_free(state.graph_ctx);
-        state.graph_ctx = nullptr;
-    }
-    state.graph = nullptr;
-    state.input = nullptr;
-    state.output = nullptr;
-    state.aux0 = nullptr;
-    state.aux1 = nullptr;
-    state.aux2 = nullptr;
-    state.aux3 = nullptr;
-    state.aux4 = nullptr;
-    state.cached_frames = -1;
-}
-
 bool infer_segmentation(const SegmentationModel & model,
                         BackendState & state,
                         const float * chunk,
+                        uintptr_t seg_lstm_cuda_options,
                         float * out_logits) {
-    ggml_cgraph * graph = build_segmentation_graph(model, state);
+    ggml_cgraph * graph = build_segmentation_graph(model, state, seg_lstm_cuda_options);
     if (!graph) {
         std::fprintf(stderr, "Error: failed to build segmentation graph\n");
         return false;
@@ -1263,39 +1256,28 @@ ggml_tensor * build_embedding_forward(ggml_context * ctx,
     return embed;
 }
 
-bool ensure_embedding_graph(const EmbeddingModel & model,
-                            BackendState & state,
-                            int num_frames) {
-    if (state.graph && state.input && state.output && state.cached_frames == num_frames) {
-        return true;
-    }
-
-    reset_cached_graph(state);
-
+ggml_cgraph * build_embedding_graph(const EmbeddingModel & model,
+                                    BackendState & state,
+                                    int num_frames) {
     ggml_init_params params = {
         /*.mem_size   =*/ state.graph_meta.size(),
         /*.mem_buffer =*/ state.graph_meta.data(),
         /*.no_alloc   =*/ true,
     };
-    state.graph_ctx = ggml_init(params);
-    if (!state.graph_ctx) {
-        return false;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return nullptr;
     }
 
-    state.cached_frames = num_frames;
-    state.graph = ggml_new_graph_custom(state.graph_ctx, kEmbGraphNodes, false);
-    state.input = ggml_new_tensor_4d(state.graph_ctx, GGML_TYPE_F32, num_frames, kMelBins, 1, 1);
-    ggml_set_name(state.input, "fbank");
-    ggml_set_input(state.input);
-    state.output = build_embedding_forward(state.graph_ctx, model, state.input);
-    ggml_set_output(state.output);
-    ggml_build_forward_expand(state.graph, state.output);
-    state.aux0 = ggml_graph_get_tensor(state.graph, "bn_eps");
-    state.aux1 = ggml_graph_get_tensor(state.graph, "tstp_ones");
-    state.aux2 = ggml_graph_get_tensor(state.graph, "tstp_t8");
-    state.aux3 = ggml_graph_get_tensor(state.graph, "tstp_t8m1");
-    state.aux4 = ggml_graph_get_tensor(state.graph, "tstp_eps");
-    return state.aux0 && state.aux1 && state.aux2 && state.aux3 && state.aux4;
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, kEmbGraphNodes, false);
+    ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, num_frames, kMelBins, 1, 1);
+    ggml_set_name(input, "fbank");
+    ggml_set_input(input);
+    ggml_tensor * output = build_embedding_forward(ctx, model, input);
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph, output);
+    ggml_free(ctx);
+    return graph;
 }
 
 bool infer_embedding(const EmbeddingModel & model,
@@ -1303,50 +1285,59 @@ bool infer_embedding(const EmbeddingModel & model,
                      const float * fbank,
                      int num_frames,
                      float * out_embedding) {
-    if (!ensure_embedding_graph(model, state, num_frames)) {
+    ggml_cgraph * graph = build_embedding_graph(model, state, num_frames);
+    if (!graph) {
         std::fprintf(stderr, "Error: failed to build embedding graph\n");
         return false;
     }
-    prefer_gpu_nodes(state, state.graph);
-    if (!ggml_backend_sched_alloc_graph(state.sched, state.graph)) {
+    prefer_gpu_nodes(state, graph);
+    if (!ggml_backend_sched_alloc_graph(state.sched, graph)) {
         std::fprintf(stderr, "Error: failed to allocate embedding graph\n");
         return false;
     }
 
-    if (!state.input || !state.output || !state.aux0 || !state.aux1 || !state.aux2 || !state.aux3 || !state.aux4) {
+    ggml_tensor * input = ggml_graph_get_tensor(graph, "fbank");
+    ggml_tensor * output = ggml_graph_get_tensor(graph, "embedding");
+    ggml_tensor * bn_eps = ggml_graph_get_tensor(graph, "bn_eps");
+    ggml_tensor * tstp_ones = ggml_graph_get_tensor(graph, "tstp_ones");
+    ggml_tensor * tstp_t8 = ggml_graph_get_tensor(graph, "tstp_t8");
+    ggml_tensor * tstp_t8m1 = ggml_graph_get_tensor(graph, "tstp_t8m1");
+    ggml_tensor * tstp_eps = ggml_graph_get_tensor(graph, "tstp_eps");
+
+    if (!input || !output || !bn_eps || !tstp_ones || !tstp_t8 || !tstp_t8m1 || !tstp_eps) {
         std::fprintf(stderr, "Error: missing embedding IO tensors\n");
         ggml_backend_sched_reset(state.sched);
         return false;
     }
 
     const float bn_eps_val = kBatchNormEps;
-    const float t8_val = static_cast<float>(state.aux1->ne[0]);
+    const float t8_val = static_cast<float>(tstp_ones->ne[0]);
     const float t8m1_val = std::max(1.0f, t8_val - 1.0f);
     const float pool_eps_val = 1e-5f;
-    state.scratch_ones.assign(static_cast<size_t>(state.aux1->ne[0]), 1.0f);
-    state.scratch_fbank.assign(static_cast<size_t>(num_frames) * kMelBins, 0.0f);
+    std::vector<float> ones(static_cast<size_t>(tstp_ones->ne[0]), 1.0f);
+    std::vector<float> fbank_planar(static_cast<size_t>(num_frames) * kMelBins, 0.0f);
 
     for (int frame = 0; frame < num_frames; ++frame) {
         for (int bin = 0; bin < kMelBins; ++bin) {
-            state.scratch_fbank[static_cast<size_t>(bin) * num_frames + frame] =
+            fbank_planar[static_cast<size_t>(bin) * num_frames + frame] =
                 fbank[static_cast<size_t>(frame) * kMelBins + bin];
         }
     }
 
-    ggml_backend_tensor_set(state.input, state.scratch_fbank.data(), 0, state.scratch_fbank.size() * sizeof(float));
-    ggml_backend_tensor_set(state.aux0, &bn_eps_val, 0, sizeof(float));
-    ggml_backend_tensor_set(state.aux1, state.scratch_ones.data(), 0, state.scratch_ones.size() * sizeof(float));
-    ggml_backend_tensor_set(state.aux2, &t8_val, 0, sizeof(float));
-    ggml_backend_tensor_set(state.aux3, &t8m1_val, 0, sizeof(float));
-    ggml_backend_tensor_set(state.aux4, &pool_eps_val, 0, sizeof(float));
+    ggml_backend_tensor_set(input, fbank_planar.data(), 0, fbank_planar.size() * sizeof(float));
+    ggml_backend_tensor_set(bn_eps, &bn_eps_val, 0, sizeof(float));
+    ggml_backend_tensor_set(tstp_ones, ones.data(), 0, ones.size() * sizeof(float));
+    ggml_backend_tensor_set(tstp_t8, &t8_val, 0, sizeof(float));
+    ggml_backend_tensor_set(tstp_t8m1, &t8m1_val, 0, sizeof(float));
+    ggml_backend_tensor_set(tstp_eps, &pool_eps_val, 0, sizeof(float));
 
-    if (ggml_backend_sched_graph_compute(state.sched, state.graph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(state.sched, graph) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "Error: embedding graph compute failed\n");
         ggml_backend_sched_reset(state.sched);
         return false;
     }
 
-    ggml_backend_tensor_get(state.output, out_embedding, 0, static_cast<size_t>(kEmbeddingDim) * sizeof(float));
+    ggml_backend_tensor_get(output, out_embedding, 0, static_cast<size_t>(kEmbeddingDim) * sizeof(float));
     ggml_backend_sched_reset(state.sched);
     return true;
 }
@@ -1967,6 +1958,7 @@ bool diarize_impl(const DiarizationConfig & config,
     }
 
     const int num_chunks = compute_num_chunks(n_samples);
+    const uintptr_t seg_lstm_cuda_options = pack_seg_lstm_cuda_options(config);
     std::vector<float> padded_audio(static_cast<size_t>((num_chunks - 1) * kStepSamples + kChunkSamples), 0.0f);
     std::memcpy(padded_audio.data(), audio, static_cast<size_t>(n_samples) * sizeof(float));
 
@@ -1977,7 +1969,7 @@ bool diarize_impl(const DiarizationConfig & config,
     for (int c = 0; c < num_chunks; ++c) {
         std::memcpy(chunk.data(), padded_audio.data() + static_cast<size_t>(c) * kStepSamples, static_cast<size_t>(kChunkSamples) * sizeof(float));
         float * logits = chunk_logits.data() + static_cast<size_t>(c) * kFramesPerChunk * kPowersetClasses;
-        if (!infer_segmentation(seg_model, seg_state, chunk.data(), logits)) {
+        if (!infer_segmentation(seg_model, seg_state, chunk.data(), seg_lstm_cuda_options, logits)) {
             cleanup();
             return false;
         }
